@@ -166,15 +166,32 @@ jobs:
           TOOL_ARCH: ${{ matrix.tool_arch }}
         run: |
           set -euo pipefail
-          # runtime libraries dlopen-ed by GPUI (wayland/EGL/vulkan) and their
-          # glvnd dependency chain; the build job does not need them
           sudo apt-get update
+          # dlopen-ed runtime libraries (wayland/EGL/vulkan + glvnd chain):
+          # invisible to linuxdeploy's ELF scan, hand-copied into the AppDir below
           sudo apt-get install --yes --no-install-recommends \
             libwayland-client0 \
             libwayland-egl1 \
             libegl1 \
             libglvnd0 \
             libvulkan1
+          # every non-excluded library in the binary's DT_NEEDED tree must be
+          # present on disk or linuxdeploy fails with "Could not find dependency"
+          # (it excludes libc/libm/libxcb/libX11/libfontconfig/libfreetype/
+          # libharfbuzz/libasound as system-provided; the rest get bundled)
+          sudo apt-get install --yes --no-install-recommends \
+            libbrotli1 \
+            libbz2-1.0 \
+            libglib2.0-0 \
+            libgraphite2-3 \
+            liblzma5 \
+            libpcre2-8-0 \
+            libpng16-16 \
+            libxau6 \
+            libxcb-xkb1 \
+            libxkbcommon0 \
+            libxkbcommon-x11-0 \
+            libxml2
           # linuxdeploy ships as an AppImage only; the runners' default PATH has
           # no unpacked tool, so download and extract it manually.
           # NOTE: --appimage-extract unpacks into ./squashfs-root relative to
