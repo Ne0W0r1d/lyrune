@@ -133,11 +133,137 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  appimage:
+    name: Linux AppImage ${{ matrix.asset_arch }}
+    needs:
+      - validate
+      - build-linux
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            asset_arch: amd64
+            tool_arch: x86_64
+          - runner: ubuntu-22.04-arm
+            asset_arch: arm64
+            tool_arch: aarch64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v6
+
+      - name: Download prebuilt binary
+        uses: actions/download-artifact@v8
+        with:
+          name: release-linux-${{ matrix.asset_arch }}
+          path: dist
+
+      - name: Install packaging tools
+        shell: bash
+        env:
+          TOOL_ARCH: ${{ matrix.tool_arch }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          # dlopen-ed runtime libraries (wayland/EGL/vulkan + glvnd chain):
+          # invisible to linuxdeploy's ELF scan, hand-copied into the AppDir below
+          sudo apt-get install --yes --no-install-recommends \
+            libwayland-client0 \
+            libwayland-egl1 \
+            libegl1 \
+            libglvnd0 \
+            libvulkan1
+          # every non-excluded library in the binary's DT_NEEDED tree must be
+          # present on disk or linuxdeploy fails with "Could not find dependency"
+          # (it excludes libc/libm/libxcb/libX11/libfontconfig/libfreetype/
+          # libharfbuzz/libasound as system-provided; the rest get bundled)
+          sudo apt-get install --yes --no-install-recommends \
+            libbrotli1 \
+            libbz2-1.0 \
+            libglib2.0-0 \
+            libgraphite2-3 \
+            liblzma5 \
+            libpcre2-8-0 \
+            libpng16-16 \
+            libxau6 \
+            libxcb-xkb1 \
+            libxkbcommon0 \
+            libxkbcommon-x11-0 \
+            libxml2
+          # linuxdeploy ships as an AppImage only; the runners' default PATH has
+          # no unpacked tool, so download and extract it manually.
+          # NOTE: --appimage-extract unpacks into ./squashfs-root relative to
+          # the *current directory*, so cd into the tools dir first — running
+          # it from the workspace drops squashfs-root outside GITHUB_PATH and
+          # the next step fails with "linuxdeploy: command not found".
+          tools_dir="$HOME/.cache/appimage-tools"
+          mkdir -p "$tools_dir"
+          curl --fail --silent --show-error --location \
+            --output "$tools_dir/linuxdeploy.AppImage" \
+            "https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-${TOOL_ARCH}.AppImage"
+          chmod +x "$tools_dir/linuxdeploy.AppImage"
+          (cd "$tools_dir" && ./linuxdeploy.AppImage --appimage-extract >/dev/null)
+          test -x "$tools_dir/squashfs-root/usr/bin/linuxdeploy"
+          echo "$tools_dir/squashfs-root/usr/bin" >> "$GITHUB_PATH"
+
+      - name: Build AppImage
+        shell: bash
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+          ASSET_ARCH: ${{ matrix.asset_arch }}
+          TRIPLET: ${{ matrix.tool_arch }}-linux-gnu
+          # appimagetool infers arch from the ELF header; pin it so the output
+          # name (Lyrune-$ARCH.AppImage) and packaging target are deterministic
+          ARCH: ${{ matrix.tool_arch }}
+        run: |
+          set -euo pipefail
+          # belt and braces: don't rely on GITHUB_PATH propagation
+          export PATH="$HOME/.cache/appimage-tools/squashfs-root/usr/bin:$PATH"
+          tar -C dist -xzf "dist/lyrune-v$VERSION-linux-$ASSET_ARCH.tar.gz"
+          binary="dist/lyrune-v$VERSION-linux-$ASSET_ARCH/lyrune"
+
+          appdir="AppDir"
+          install -Dm755 "$binary" "$appdir/usr/bin/lyrune"
+          install -Dm644 packaging/arch/lyrune.desktop "$appdir/usr/share/applications/lyrune.desktop"
+          install -Dm644 packaging/arch/lyrune.desktop "$appdir/lyrune.desktop"
+          install -Dm644 crates/lyrune-app/assets/lyrune.svg \
+            "$appdir/usr/share/icons/hicolor/scalable/apps/lyrune.svg"
+
+          # libraries loaded at runtime via dlopen, invisible to linuxdeploy's
+          # scan (plus libGLdispatch for glvnd's libEGL, excluded by default).
+          # flat usr/lib: AppRun's LD_LIBRARY_PATH and the binary's RUNPATH
+          # ($ORIGIN/../lib) both resolve there
+          for lib in libwayland-client.so.0 libwayland-egl.so.1 libEGL.so.1 \
+                     libGLdispatch.so.0 libvulkan.so.1; do
+            install -Dm755 "/usr/lib/$TRIPLET/$lib" "$appdir/usr/lib/$lib"
+          done
+
+          linuxdeploy \
+            --appdir "$appdir" \
+            --desktop-file "$appdir/usr/share/applications/lyrune.desktop" \
+            --icon-file "$appdir/usr/share/icons/hicolor/scalable/apps/lyrune.svg" \
+            --output appimage
+
+          appimage_name="lyrune-v$VERSION-linux-$ASSET_ARCH.AppImage"
+          mv -f Lyrune-*.AppImage "$appimage_name"
+          echo "built $appimage_name"
+
+      - name: Upload AppImage release asset
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-appimage-${{ matrix.asset_arch }}
+          path: lyrune-v${{ needs.validate.outputs.version }}-linux-${{ matrix.asset_arch }}.AppImage
+          if-no-files-found: error
+          retention-days: 7
+
   release:
     name: Create draft release
     needs:
       - validate
       - build-linux
+      - appimage
     runs-on: ubuntu-24.04
     permissions:
       contents: write
