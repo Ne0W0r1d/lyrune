@@ -4,6 +4,8 @@ mod credentials;
 mod design;
 mod http;
 mod icons;
+#[cfg(target_os = "linux")]
+mod inhibit;
 mod library;
 mod lyrics_cache;
 #[cfg(target_os = "linux")]
@@ -107,6 +109,14 @@ struct MprisState {
 
 #[cfg(target_os = "linux")]
 impl Global for MprisState {}
+
+#[cfg(target_os = "linux")]
+struct InhibitState {
+    _service: inhibit::InhibitService,
+}
+
+#[cfg(target_os = "linux")]
+impl Global for InhibitState {}
 
 fn open_restored_window(
     view: Entity<LyruneView>,
@@ -268,6 +278,18 @@ fn main() {
                     .detach();
                 }
                 Err(error) => eprintln!("MPRIS 服务不可用：{error:#}"),
+            }
+
+            #[cfg(target_os = "linux")]
+            match inhibit::install() {
+                Ok(service) => {
+                    let inhibit_handle = service.handle();
+                    main_window.borrow().view.update(cx, |view, _| {
+                        view.attach_inhibit(inhibit_handle);
+                    });
+                    cx.set_global(InhibitState { _service: service });
+                }
+                Err(error) => eprintln!("睡眠阻止服务不可用：{error:#}"),
             }
 
             let main_window_for_tray = main_window;

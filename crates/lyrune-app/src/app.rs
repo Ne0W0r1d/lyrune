@@ -43,6 +43,8 @@ use crate::library::{
 };
 use crate::lyrics_cache::LyricDiskCache;
 #[cfg(target_os = "linux")]
+use crate::inhibit::InhibitHandle;
+#[cfg(target_os = "linux")]
 use crate::mpris::{
     MprisCommand, MprisHandle, MprisLoopStatus, MprisPlaybackStatus, MprisSnapshot, MprisTrack,
 };
@@ -2326,6 +2328,8 @@ pub struct LyruneView {
     #[cfg(target_os = "linux")]
     mpris: Option<MprisHandle>,
     #[cfg(target_os = "linux")]
+    inhibit: Option<InhibitHandle>,
+    #[cfg(target_os = "linux")]
     last_mpris_position_sync: Instant,
 }
 
@@ -2668,6 +2672,8 @@ impl LyruneView {
             #[cfg(target_os = "linux")]
             mpris: None,
             #[cfg(target_os = "linux")]
+            inhibit: None,
+            #[cfg(target_os = "linux")]
             last_mpris_position_sync: Instant::now(),
         };
         view.attach_window(window, cx);
@@ -2978,6 +2984,14 @@ impl LyruneView {
     pub(crate) fn attach_mpris(&mut self, mpris: MprisHandle) {
         self.mpris = Some(mpris);
         self.sync_mpris(false);
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn attach_inhibit(&mut self, inhibit: InhibitHandle) {
+        self.inhibit = Some(inhibit);
+        if let Some(inhibit) = &self.inhibit {
+            inhibit.set_active(self.playback_is_advancing());
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -5949,14 +5963,17 @@ impl LyruneView {
 
     #[cfg(target_os = "linux")]
     fn sync_mpris(&self, seeked: bool) {
-        let Some(mpris) = &self.mpris else {
-            return;
-        };
-        let snapshot = self.mpris_snapshot();
-        if seeked {
-            mpris.seeked(snapshot);
-        } else {
-            mpris.update(snapshot);
+        if let Some(mpris) = &self.mpris {
+            let snapshot = self.mpris_snapshot();
+            if seeked {
+                mpris.seeked(snapshot);
+            } else {
+                mpris.update(snapshot);
+            }
+        }
+        // 播放中阻止系统睡眠，暂停/停止后立即恢复（sync 路径覆盖全部播放状态变更）。
+        if let Some(inhibit) = &self.inhibit {
+            inhibit.set_active(self.playback_is_advancing());
         }
     }
 
