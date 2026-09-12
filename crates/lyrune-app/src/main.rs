@@ -13,6 +13,8 @@ mod settings;
 mod single_instance;
 mod singleflight;
 mod tray;
+#[cfg(target_os = "linux")]
+mod window_chrome;
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -21,7 +23,7 @@ use std::time::Duration;
 use app::LyruneView;
 use gpui::*;
 use gpui_component::Root;
-use settings::{PersistedWindowSize, SettingsStore, TrayIconStyle};
+use settings::{PersistedWindowSize, SettingsStore, TrayIconStyle, WindowDecoration};
 use tray::TrayCommand;
 
 const DEFAULT_WINDOW_WIDTH: f32 = 1080.;
@@ -29,6 +31,42 @@ const DEFAULT_WINDOW_HEIGHT: f32 = 760.;
 const MIN_WINDOW_WIDTH: f32 = 800.;
 const MIN_WINDOW_HEIGHT: f32 = 600.;
 const INACTIVE_WINDOW_FRAME_INTERVAL: Duration = Duration::from_millis(40);
+
+/// 窗口装饰策略：`Auto` 走 gpui 默认（请求 SSD，Wayland 合成器不支持时自动回退
+/// CSD，应用随之补画自绘标题栏）；`Always` 无条件自绘标题栏。
+///
+/// X11 下阴影环需要 32 位 ARGB surface，而 gpui 的 X11 后端只在
+/// `background_appearance != Opaque` 时启用透明合成（Wayland 则由 CSD 自动触发），
+/// 因此自绘模式下必须同时请求透明窗口背景。
+fn main_window_options(
+    window_size: Option<PersistedWindowSize>,
+    decoration: WindowDecoration,
+    cx: &App,
+) -> WindowOptions {
+    let bounds = Bounds::centered(None, initial_window_size(window_size, cx), cx);
+    WindowOptions {
+        titlebar: Some(TitlebarOptions {
+            title: Some("Lyrune".into()),
+            ..Default::default()
+        }),
+        window_decorations: match decoration {
+            WindowDecoration::Auto => None,
+            WindowDecoration::Always => Some(WindowDecorations::Client),
+        },
+        window_background: if cfg!(target_os = "linux")
+            && matches!(decoration, WindowDecoration::Always)
+        {
+            WindowBackgroundAppearance::Transparent
+        } else {
+            WindowBackgroundAppearance::Opaque
+        },
+        window_bounds: Some(WindowBounds::Windowed(bounds)),
+        window_min_size: Some(size(px(MIN_WINDOW_WIDTH), px(MIN_WINDOW_HEIGHT))),
+        inactive_frame_interval: Some(INACTIVE_WINDOW_FRAME_INTERVAL),
+        app_id: Some("lyrune".to_owned()),
+        ..Default::default()
+    }
+}
 
 fn initial_window_size(window_size: Option<PersistedWindowSize>, cx: &App) -> Size<Pixels> {
     let (mut width, mut height) = window_size
@@ -43,21 +81,6 @@ fn initial_window_size(window_size: Option<PersistedWindowSize>, cx: &App) -> Si
         height = height.min(f32::from(display_size.height).max(MIN_WINDOW_HEIGHT));
     }
     size(px(width), px(height))
-}
-
-fn main_window_options(window_size: Option<PersistedWindowSize>, cx: &App) -> WindowOptions {
-    let bounds = Bounds::centered(None, initial_window_size(window_size, cx), cx);
-    WindowOptions {
-        titlebar: Some(TitlebarOptions {
-            title: Some("Lyrune".into()),
-            ..Default::default()
-        }),
-        window_bounds: Some(WindowBounds::Windowed(bounds)),
-        window_min_size: Some(size(px(MIN_WINDOW_WIDTH), px(MIN_WINDOW_HEIGHT))),
-        inactive_frame_interval: Some(INACTIVE_WINDOW_FRAME_INTERVAL),
-        app_id: Some("lyrune".to_owned()),
-        ..Default::default()
-    }
 }
 
 struct MainWindowState {
@@ -89,7 +112,10 @@ fn open_restored_window(
     view: Entity<LyruneView>,
     cx: &mut App,
 ) -> anyhow::Result<WindowHandle<Root>> {
-    let options = main_window_options(view.read(cx).window_size(), cx);
+    let options = {
+        let view = view.read(cx);
+        main_window_options(view.window_size(), view.window_decoration(), cx)
+    };
     cx.open_window(options, move |window, cx| {
         view.update(cx, |view, cx| view.attach_window(window, cx));
         cx.new(|cx| Root::new(view, window, cx))
@@ -133,6 +159,7 @@ fn main() {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let http_client = http::client().expect("create image HTTP client");
     gpui_platform::application()
+        .with_assets(gpui_component_assets::Assets)
         .with_http_client(http_client)
         .with_quit_mode(QuitMode::Explicit)
         .run(|cx: &mut App| {
@@ -159,9 +186,10 @@ fn main() {
 
             let view_slot = Rc::new(RefCell::new(None));
             let view_slot_for_window = view_slot.clone();
+            let window_decoration = settings.window_decoration;
             let window_handle = cx
                 .open_window(
-                    main_window_options(settings.window_size, cx),
+                    main_window_options(settings.window_size, window_decoration, cx),
                     move |window, cx| {
                         let view = cx.new(|cx| LyruneView::new(window, settings, fonts, cx));
                         *view_slot_for_window.borrow_mut() = Some(view.clone());

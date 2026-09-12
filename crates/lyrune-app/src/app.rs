@@ -51,8 +51,8 @@ use crate::settings::{
     AppSettings, CdnCacheStore, DEFAULT_NAVIGATION_HISTORY_LIMIT, LibraryCache, LyricFrameRate,
     MAX_IMAGE_CACHE_CAPACITY, MAX_NAVIGATION_HISTORY_LIMIT, PersistedLibraryView,
     PersistedPlayback, PersistedQueueContinuation, PersistedWindowSize, SettingsStore,
-    TrayIconStyle, default_lyric_font_families, default_monospace_font_families,
-    default_ui_font_families, parse_font_families,
+    TrayIconStyle, WindowDecoration, default_lyric_font_families,
+    default_monospace_font_families, default_ui_font_families, parse_font_families,
 };
 use crate::singleflight::SingleFlight;
 use qqmusic_api::integration::{
@@ -2316,6 +2316,8 @@ pub struct LyruneView {
     account_menu_open: bool,
     _subscriptions: Vec<Subscription>,
     _window_subscription: Option<Subscription>,
+    #[cfg(target_os = "linux")]
+    _appearance_subscription: Option<Subscription>,
     window_tick_wake: Option<async_channel::Sender<()>>,
     background_tick_wake: Option<async_channel::Sender<()>>,
     lyric_animation_frame_pending: bool,
@@ -2656,6 +2658,8 @@ impl LyruneView {
             account_menu_open: false,
             _subscriptions: subscriptions,
             _window_subscription: None,
+            #[cfg(target_os = "linux")]
+            _appearance_subscription: None,
             window_tick_wake: None,
             background_tick_wake: None,
             lyric_animation_frame_pending: false,
@@ -2678,6 +2682,14 @@ impl LyruneView {
         self.next_lyric_highlight_frame = None;
         self.next_lyric_scroll_frame = None;
         window.set_inactive_frame_interval(self.inactive_window_frame_interval());
+        #[cfg(target_os = "linux")]
+        {
+            self._appearance_subscription = Some(window.observe_window_appearance(|window, _| {
+                // 合成器可能在运行期改变实际装饰模式（如 KWin 的标题栏规则），
+                // 刷新以让 CSD 框架立即显示或隐藏自绘标题栏。
+                window.refresh();
+            }));
+        }
         self._window_subscription = Some(cx.observe_window_bounds(window, |this, window, _| {
             let size = window.window_bounds().get_bounds().size;
             let width = f32::from(size.width).round() as u32;
@@ -2930,6 +2942,36 @@ impl LyruneView {
 
     pub(crate) fn window_size(&self) -> Option<PersistedWindowSize> {
         self.settings.window_size
+    }
+
+    pub(crate) fn window_decoration(&self) -> WindowDecoration {
+        self.settings.window_decoration
+    }
+
+    #[cfg(target_os = "linux")]
+    fn set_window_decoration(
+        &mut self,
+        decoration: WindowDecoration,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.settings.window_decoration == decoration {
+            return;
+        }
+        self.settings.window_decoration = decoration;
+        window.request_decorations(match decoration {
+            WindowDecoration::Auto => WindowDecorations::Server,
+            WindowDecoration::Always => WindowDecorations::Client,
+        });
+        // X11 后端的 surface 透明合成由 background_appearance 决定，与窗口创建时
+        // main_window_options 的映射保持一致（Wayland 下 CSD 本身即透明，不受影响）。
+        window.set_background_appearance(match decoration {
+            WindowDecoration::Auto => WindowBackgroundAppearance::Opaque,
+            WindowDecoration::Always => WindowBackgroundAppearance::Transparent,
+        });
+        self.persist_settings();
+        window.refresh();
+        cx.notify();
     }
 
     #[cfg(target_os = "linux")]
@@ -6570,6 +6612,42 @@ impl LyruneView {
                     )
             })
             .collect::<Vec<_>>();
+        #[cfg(target_os = "linux")]
+        let decoration_section: Option<AnyElement> = {
+            let selected_decoration = self.settings.window_decoration;
+            let decoration_buttons = WindowDecoration::ALL
+                .into_iter()
+                .map(|decoration| {
+                    Button::new(decoration.id())
+                        .label(decoration.label())
+                        .ghost()
+                        .flex_1()
+                        .h(px(38.))
+                        .selected(selected_decoration == decoration)
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.set_window_decoration(decoration, window, cx)
+                        }))
+                })
+                .collect::<Vec<_>>();
+            Some(
+                v_flex()
+                    .gap_2()
+                    .pt_4()
+                    .border_t_1()
+                    .border_color(theme.border)
+                    .child(div().font_medium().child("窗口标题栏"))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child("优先系统装饰：由桌面环境绘制标题栏，若其不提供则自动回退为自绘标题栏；若你的桌面报告有系统标题栏却看不到/无法关闭窗口，请选始终自绘"),
+                    )
+                    .child(h_flex().w_full().gap_1().children(decoration_buttons))
+                    .into_any_element(),
+            )
+        };
+        #[cfg(not(target_os = "linux"))]
+        let decoration_section: Option<AnyElement> = None;
         let preferred_quality = self.settings.playback_quality;
         let quality_rows = Quality::ALL
             .chunks(2)
@@ -6673,6 +6751,7 @@ impl LyruneView {
                                                 .children(tray_icon_buttons),
                                         ),
                                 )
+                                .children(decoration_section)
                                 .child(
                                     v_flex()
                                         .gap_3()
@@ -9805,11 +9884,14 @@ impl Drop for LyruneView {
 
 impl Render for LyruneView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if self.account_state == AccountState::SignedIn {
+        let content = if self.account_state == AccountState::SignedIn {
             self.render_main(window, cx)
         } else {
             self.render_login(cx)
-        }
+        };
+        #[cfg(target_os = "linux")]
+        let content = crate::window_chrome::decorate(content, self.settings.window_decoration, window, cx);
+        content
     }
 }
 

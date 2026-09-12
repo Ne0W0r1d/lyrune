@@ -61,6 +61,40 @@ pub enum LyricFrameRate {
     Display,
 }
 
+/// 窗口装饰策略。
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WindowDecoration {
+    /// 请求 SSD；合成器/WM 回退到 CSD 时自动补画应用标题栏。
+    #[default]
+    Auto,
+    /// 无视合成器声称的装饰模式，无条件绘制应用标题栏 —— 用于 WM 报告
+    /// SSD 但实际不绘制标题栏（GNOME/Mutter、部分 KWin 配置等）导致无法
+    /// 关闭窗口的环境。
+    ///
+    /// 旧版本实验性的 `client-side` 配置值兼容映射到这里。
+    #[serde(alias = "client-side")]
+    Always,
+}
+
+impl WindowDecoration {
+    pub const ALL: [Self; 2] = [Self::Auto, Self::Always];
+
+    pub const fn id(self) -> &'static str {
+        match self {
+            Self::Auto => "window-decoration-auto",
+            Self::Always => "window-decoration-always",
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "优先系统装饰（SSD）",
+            Self::Always => "始终使用客户端自绘标题栏",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum TrayIconStyle {
@@ -149,6 +183,7 @@ pub struct AppSettings {
     pub last_nonzero_volume: f32,
     pub color_theme: ColorTheme,
     pub tray_icon_style: TrayIconStyle,
+    pub window_decoration: WindowDecoration,
     pub ui_font_families: Vec<String>,
     pub monospace_font_families: Vec<String>,
     pub lyric_font_families: Vec<String>,
@@ -172,6 +207,7 @@ impl Default for AppSettings {
             last_nonzero_volume: 1.,
             color_theme: ColorTheme::default(),
             tray_icon_style: TrayIconStyle::default(),
+            window_decoration: WindowDecoration::default(),
             ui_font_families: default_ui_font_families(),
             monospace_font_families: default_monospace_font_families(),
             lyric_font_families: default_lyric_font_families(),
@@ -463,6 +499,12 @@ mod tests {
         assert_eq!(settings.last_nonzero_volume, 1.);
         assert_eq!(settings.color_theme, ColorTheme::EverforestLight);
         assert_eq!(settings.tray_icon_style, TrayIconStyle::Color);
+        assert_eq!(settings.window_decoration, WindowDecoration::Auto);
+        // 旧版本的实验性值必须继续可解析。
+        let legacy: AppSettings =
+            serde_json::from_str(r#"{"window_decoration":"client-side"}"#)
+                .expect("deserialize legacy decoration value");
+        assert_eq!(legacy.window_decoration, WindowDecoration::Always);
         assert_eq!(settings.ui_font_families, [".SystemUIFont"]);
         assert_eq!(
             settings.monospace_font_families,
@@ -499,6 +541,7 @@ mod tests {
             last_nonzero_volume: -1.,
             color_theme: ColorTheme::CatppuccinMocha,
             tray_icon_style: TrayIconStyle::Light,
+            window_decoration: WindowDecoration::Always,
             ui_font_families: default_ui_font_families(),
             monospace_font_families: default_monospace_font_families(),
             lyric_font_families: default_lyric_font_families(),
@@ -537,6 +580,7 @@ mod tests {
             last_nonzero_volume: 0.64,
             color_theme: ColorTheme::EverforestDark,
             tray_icon_style: TrayIconStyle::Dark,
+            window_decoration: WindowDecoration::Always,
             ui_font_families: vec!["Inter".to_owned(), "Noto Sans CJK SC".to_owned()],
             monospace_font_families: vec!["JetBrains Mono".to_owned()],
             lyric_font_families: vec!["LXGW WenKai".to_owned(), "Noto Sans JP".to_owned()],
@@ -578,6 +622,7 @@ mod tests {
         assert_eq!(restored.last_nonzero_volume, expected.last_nonzero_volume);
         assert_eq!(restored.color_theme, expected.color_theme);
         assert_eq!(restored.tray_icon_style, expected.tray_icon_style);
+        assert_eq!(restored.window_decoration, expected.window_decoration);
         assert_eq!(restored.ui_font_families, expected.ui_font_families);
         assert_eq!(
             restored.monospace_font_families,
