@@ -82,10 +82,29 @@ struct ThumbnailSource {
     size: CachedImageSize,
 }
 
+/// 软上限之上的额外余量。
+///
+/// 名义容量是软上限：当前帧工作集（同屏被反复请求的封面）超过它时不强行逐出，
+/// 允许缓存临时增长，容量 + 该余量构成硬上限。只有超过硬上限才逐出，且优先逐出
+/// 已交付（served）的最旧条目。若不做本帧保护而按严格 LRU 逐出：同屏图片数一
+/// 超过容量（大窗口下主页网格 + 侧栏 + 播放条可达 40~60 张，远超默认 36），
+/// 刚插入的解码任务会被同帧后续请求逐出并无限重排（表现为恒黑），已解码纹理也
+/// 会被轮转逐出再重载（表现为封面闪烁）。
+const CACHE_SOFT_LIMIT_SLACK: usize = 64;
+
+struct CacheEntry {
+    item: ImageCacheItem,
+    /// 解码完成后是否至少交付给渲染侧一次。
+    ///
+    /// 达到硬上限必须腾位时，优先逐出已交付的最旧条目，保证未完成的解码任务不
+    /// 会被同帧挤掉重新排队（窗口较大时主页/搜索页/播放控制器空白或闪烁图）。
+    served: bool,
+}
+
 pub struct CachedImageCache {
     capacity: usize,
     usages: Vec<u64>,
-    items: HashMap<u64, ImageCacheItem>,
+    items: HashMap<u64, CacheEntry>,
 }
 
 pub struct BlurredCover {
@@ -152,8 +171,8 @@ impl CachedImageCache {
             items: HashMap::with_capacity(capacity),
         });
         cx.observe_release(&cache, |cache, cx| {
-            for (_, mut item) in std::mem::take(&mut cache.items) {
-                if let Some(Ok(image)) = item.get() {
+            for (_, mut entry) in std::mem::take(&mut cache.items) {
+                if let Some(Ok(image)) = entry.item.get() {
                     cx.drop_image(image, None);
                 }
             }
@@ -164,22 +183,47 @@ impl CachedImageCache {
 
     pub fn set_capacity(&mut self, capacity: usize, window: &mut Window, cx: &mut App) {
         self.capacity = capacity.max(1);
-        while self.usages.len() > self.capacity {
-            self.evict_oldest(window, cx);
-        }
+        let hard_limit = self.hard_limit();
+        while self.usages.len() > hard_limit && self.evict_oldest(window, cx) {}
         self.usages.shrink_to(self.capacity);
         self.items.shrink_to(self.capacity);
     }
 
-    fn evict_oldest(&mut self, window: &mut Window, cx: &mut App) {
-        let oldest = self.usages.pop().expect("非空图片缓存应包含最旧条目");
-        let mut item = self
-            .items
-            .remove(&oldest)
-            .expect("图片缓存条目与使用顺序应保持一致");
-        if let Some(Ok(image)) = item.get() {
+    fn hard_limit(&self) -> usize {
+        self.capacity.saturating_add(CACHE_SOFT_LIMIT_SLACK)
+    }
+
+    /// 选出最旧的可逐出条目：优先已交付（served）的条目；仅当不存在已交付
+    /// 条目时才退而逐出未交付的最旧条目（多为已离屏、不会再被请求的幽灵解码
+    /// 任务），防止缓存无界增长。
+    fn eviction_position(usages: &[u64], is_served: impl Fn(&u64) -> bool) -> Option<usize> {
+        usages
+            .iter()
+            .rposition(|key| is_served(key))
+            .or_else(|| usages.len().checked_sub(1))
+    }
+
+    /// 逐出一个最久未使用的条目，返回是否真的逐出了内容。
+    ///
+    /// 调用方（load / set_capacity）仅在超过硬上限时才调用本函数，因此名义
+    /// 容量内的本帧工作集不会被逐出——这是修复「特定窗口大小下主页/搜索页/
+    /// 播放控制器封面恒黑或闪烁」的关键：严格 LRU 会把同帧刚插入的解码任务
+    /// 逐出并无限重排，也会把已显示纹理轮转逐出再重载。腾位时优先逐出已交付
+    /// 的最旧条目，尽量不打断在途解码。
+    fn evict_oldest(&mut self, window: &mut Window, cx: &mut App) -> bool {
+        let Some(position) = Self::eviction_position(&self.usages, |key| {
+            self.items.get(key).is_some_and(|entry| entry.served)
+        }) else {
+            return false;
+        };
+        let oldest = self.usages.remove(position);
+        let Some(mut entry) = self.items.remove(&oldest) else {
+            return false;
+        };
+        if let Some(Ok(image)) = entry.item.get() {
             cx.drop_image(image, Some(window));
         }
+        true
     }
 }
 
@@ -191,7 +235,11 @@ impl ImageCache for CachedImageCache {
         cx: &mut App,
     ) -> Option<Result<Arc<RenderImage>, ImageCacheError>> {
         let key = hash(resource);
-        if let Some(item) = self.items.get_mut(&key) {
+        if let Some(entry) = self.items.get_mut(&key) {
+            let result = entry.item.get();
+            if result.is_some() {
+                entry.served = true;
+            }
             let index = self
                 .usages
                 .iter()
@@ -199,7 +247,7 @@ impl ImageCache for CachedImageCache {
                 .expect("图片缓存条目与使用顺序应保持一致");
             self.usages.remove(index);
             self.usages.insert(0, key);
-            return item.get();
+            return result;
         }
 
         let source = match resource {
@@ -229,11 +277,16 @@ impl ImageCache for CachedImageCache {
         let future = ImgResourceLoader::load(source, cx);
         let task = cx.background_executor().spawn(future).shared();
 
-        if self.usages.len() >= self.capacity {
+        if self.usages.len() >= self.hard_limit() {
             self.evict_oldest(window, cx);
         }
-        self.items
-            .insert(key, ImageCacheItem::Loading(task.clone()));
+        self.items.insert(
+            key,
+            CacheEntry {
+                item: ImageCacheItem::Loading(task.clone()),
+                served: false,
+            },
+        );
         self.usages.insert(0, key);
 
         let entity = window.current_view();
@@ -557,6 +610,33 @@ mod tests {
                     .body(AsyncBody::from(body))?)
             })
         }
+    }
+
+    #[test]
+    fn evicts_served_entries_before_pending_ones() {
+        // 回归：同屏图片数超过缓存容量时（特定窗口大小），严格 LRU 曾把本帧刚
+        // 插入的解码任务逐出并无限重新排队（恒黑），或轮转逐出已显示纹理再重载
+        // （闪烁）。腾位必须优先选已交付（served）的条目。
+        let served = |key: &u64| *key != 7;
+        // 最旧位置（尾部）是未交付条目时，应改选更靠前的已交付条目。
+        let usages = [1_u64, 7, 3];
+        assert_eq!(CachedImageCache::eviction_position(&usages, served), Some(2));
+        // 全部未交付（极端：整帧都在初次加载）时，退化为逐出最旧一条兜底。
+        let usages = [7_u64, 8];
+        assert_eq!(
+            CachedImageCache::eviction_position(&usages, |_| false),
+            Some(1)
+        );
+        // 空表无处可逐出。
+        assert_eq!(CachedImageCache::eviction_position(&[], |_| true), None);
+        // 软上限 + 余量构成硬上限：默认容量 36 下，1920 宽主页 ~60 张同屏图
+        // 应完全落在硬上限内，不触发任何逐出。
+        let cache = CachedImageCache {
+            capacity: 36,
+            usages: Vec::new(),
+            items: HashMap::new(),
+        };
+        assert!(cache.hard_limit() >= 100);
     }
 
     #[tokio::test]

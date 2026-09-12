@@ -6759,7 +6759,7 @@ impl LyruneView {
                                         ))
                                         .child(number_setting(
                                             "图片内存缓存",
-                                            "图片最大缓存数，缩小该数值可以减少内存占用，但同屏显示图片超过该数值会出现渲染问题",
+                                            "图片最大缓存数，缩小该数值可以减少内存占用；同屏图片超出该数值时会自动换入换出，不影响渲染",
                                             &self.image_cache_capacity_input,
                                             "张",
                                             true,
